@@ -11,7 +11,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use hickory_resolver::{
     config::{ResolverConfig, ResolverOpts},
     proto::rr::{
@@ -97,7 +97,7 @@ impl Config {
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    resolver: Arc<TokioAsyncResolver>,
+    resolvers: Arc<Vec<TokioAsyncResolver>>,
 }
 
 #[derive(Serialize)]
@@ -123,12 +123,15 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_env()?);
 
-    let resolver =
-        TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), ResolverOpts::default());
+    let resolvers = vec![
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), ResolverOpts::default()),
+        TokioAsyncResolver::tokio(ResolverConfig::google_https(), ResolverOpts::default()),
+        TokioAsyncResolver::tokio(ResolverConfig::quad9_https(), ResolverOpts::default()),
+    ];
 
     let state = AppState {
         config: config.clone(),
-        resolver: Arc::new(resolver),
+        resolvers: Arc::new(resolvers),
     };
 
     let app = Router::new()
@@ -165,7 +168,7 @@ async fn health() -> Json<Health> {
         service: SERVICE,
         version: VERSION,
         ech_mode: "hard",
-        dns: "cloudflare-doh",
+        dns: "encrypted-doh-failover",
     })
 }
 
@@ -196,11 +199,35 @@ async fn relay_session(client: WebSocket, state: AppState) -> Result<()> {
 }
 
 async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
-    let cfg = &state.config;
+    let mut attempts = FuturesUnordered::new();
 
+    for resolver in state.resolvers.iter() {
+        let cfg = state.config.clone();
+        attempts.push(async move { open_upstream_with_resolver(resolver, &cfg).await });
+    }
+
+    let mut errors = Vec::new();
+
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(ws) => return Ok(ws),
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+
+    bail!(
+        "all encrypted DNS upstream attempts failed: {}",
+        errors.join(" | ")
+    )
+}
+
+async fn open_upstream_with_resolver(
+    resolver: &TokioAsyncResolver,
+    cfg: &Config,
+) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
     let ech_lists = timeout(
         cfg.connect_timeout,
-        lookup_ech_configs(&state.resolver, &cfg.worker_host, cfg.worker_port),
+        lookup_ech_configs(resolver, &cfg.worker_host, cfg.worker_port),
     )
     .await
     .context("ECH DNS lookup timed out")??;
@@ -220,7 +247,7 @@ async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<Tcp
         .with_no_client_auth();
 
     let tcp = connect_via_doh(
-        &state.resolver,
+        resolver,
         &cfg.worker_host,
         cfg.worker_port,
         cfg.connect_timeout,
