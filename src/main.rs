@@ -109,6 +109,13 @@ struct Health {
     dns: &'static str,
 }
 
+#[derive(Serialize)]
+struct Probe {
+    ok: bool,
+    stage: &'static str,
+    error: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -136,6 +143,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/probe", get(probe))
         .route(&config.public_relay_path, get(relay_upgrade))
         .fallback(not_found)
         .with_state(state);
@@ -170,6 +178,24 @@ async fn health() -> Json<Health> {
         ech_mode: "hard",
         dns: "encrypted-doh-failover",
     })
+}
+
+async fn probe(State(state): State<AppState>) -> Json<Probe> {
+    match open_upstream(&state).await {
+        Ok(mut ws) => {
+            let _ = ws.close(None).await;
+            Json(Probe {
+                ok: true,
+                stage: "upstream-ech-websocket",
+                error: None,
+            })
+        }
+        Err(err) => Json(Probe {
+            ok: false,
+            stage: "upstream-ech-websocket",
+            error: Some(err.to_string()),
+        }),
+    }
 }
 
 async fn not_found() -> impl IntoResponse {
