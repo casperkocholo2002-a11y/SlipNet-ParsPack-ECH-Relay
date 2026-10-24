@@ -39,6 +39,10 @@ use tracing_subscriber::EnvFilter;
 
 const SERVICE: &str = "slipnet-ech-relay";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_PUBLIC_RELAY_PATH: &str = "/p/92943149c56048dda2b2123e591f9e7de9d79ae7d0d086db";
+const DEFAULT_WORKER_HOST: &str =
+    "slipnet-route1-a-20261024t182334z.edgecache-628bbe41dc.workers.dev";
+const DEFAULT_WORKER_PATH: &str = "/o/2eb8ae8480741e9c9fc01cb5fa2b4550d2650e48c6e2e437";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -54,13 +58,17 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let port = env_u16("PORT", 8080)?;
-        let public_relay_path = required_path("PUBLIC_RELAY_PATH")?;
+        let public_relay_path =
+            env::var("PUBLIC_RELAY_PATH").unwrap_or_else(|_| DEFAULT_PUBLIC_RELAY_PATH.to_owned());
+        validate_path("PUBLIC_RELAY_PATH", &public_relay_path)?;
         let worker_host = env::var("WORKER_HOST")
-            .context("WORKER_HOST is required")?
+            .unwrap_or_else(|_| DEFAULT_WORKER_HOST.to_owned())
             .trim()
             .to_owned();
         validate_host(&worker_host)?;
-        let worker_path = required_path("WORKER_PATH")?;
+        let worker_path =
+            env::var("WORKER_PATH").unwrap_or_else(|_| DEFAULT_WORKER_PATH.to_owned());
+        validate_path("WORKER_PATH", &worker_path)?;
         let worker_port = env_u16("WORKER_PORT", 443)?;
         let connect_timeout = Duration::from_millis(env_u64("CONNECT_TIMEOUT_MS", 6000)?);
         let max_message_size = env_usize("MAX_MESSAGE_BYTES", 64 * 1024 * 1024)?;
@@ -387,12 +395,11 @@ fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumMessage> {
     }
 }
 
-fn required_path(name: &str) -> Result<String> {
-    let value = env::var(name).with_context(|| format!("{name} is required"))?;
+fn validate_path(name: &str, value: &str) -> Result<()> {
     if !value.starts_with('/') || value.starts_with("//") || value.contains("..") {
         bail!("{name} must be an absolute single-slash path without '..'");
     }
-    Ok(value)
+    Ok(())
 }
 
 fn validate_host(host: &str) -> Result<()> {
