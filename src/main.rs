@@ -376,7 +376,7 @@ async fn bridge(client: WebSocket, upstream: WebSocketStream<TlsStream<TcpStream
 
 fn axum_to_tungstenite(message: AxumMessage) -> Option<TungsteniteMessage> {
     match message {
-        AxumMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
+        AxumMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string())),
         AxumMessage::Binary(data) => Some(TungsteniteMessage::Binary(data)),
         AxumMessage::Ping(data) => Some(TungsteniteMessage::Ping(data)),
         AxumMessage::Pong(data) => Some(TungsteniteMessage::Pong(data)),
@@ -386,7 +386,7 @@ fn axum_to_tungstenite(message: AxumMessage) -> Option<TungsteniteMessage> {
 
 fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<AxumMessage> {
     match message {
-        TungsteniteMessage::Text(text) => Some(AxumMessage::Text(text.to_string().into())),
+        TungsteniteMessage::Text(text) => Some(AxumMessage::Text(text.to_string())),
         TungsteniteMessage::Binary(data) => Some(AxumMessage::Binary(data)),
         TungsteniteMessage::Ping(data) => Some(AxumMessage::Ping(data)),
         TungsteniteMessage::Pong(data) => Some(AxumMessage::Pong(data)),
