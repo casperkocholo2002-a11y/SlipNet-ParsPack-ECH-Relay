@@ -321,7 +321,16 @@ async fn lookup_ech_configs(
             .iter()
             .find(|(key, _)| *key == SvcParamKey::EchConfig)
         {
-            ech_lists.push(EchConfigListBytes::from(value.clone().0));
+            // Hickory 0.24 strips the ECHConfigList's two-byte vector length
+            // while decoding the SVCB parameter. rustls expects the complete
+            // TLS vector encoding, so restore that prefix before parsing.
+            let payload = &value.0;
+            let payload_len =
+                u16::try_from(payload.len()).context("ECHConfigList exceeds u16 length")?;
+            let mut wire = Vec::with_capacity(payload.len() + 2);
+            wire.extend_from_slice(&payload_len.to_be_bytes());
+            wire.extend_from_slice(payload);
+            ech_lists.push(EchConfigListBytes::from(wire));
         }
     }
 
