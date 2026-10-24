@@ -13,13 +13,12 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use hickory_resolver::{
-    config::{ResolverConfig, CLOUDFLARE},
-    net::runtime::TokioRuntimeProvider,
+    config::{ResolverConfig, ResolverOpts},
     proto::rr::{
         rdata::svcb::{SvcParamKey, SvcParamValue},
         RData, RecordType,
     },
-    Resolver, TokioResolver,
+    TokioAsyncResolver,
 };
 use rustls::{
     client::{EchConfig, EchMode, EchStatus},
@@ -90,7 +89,7 @@ impl Config {
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    resolver: Arc<TokioResolver>,
+    resolver: Arc<TokioAsyncResolver>,
 }
 
 #[derive(Serialize)]
@@ -116,12 +115,8 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_env()?);
 
-    let resolver = Resolver::builder_with_config(
-        ResolverConfig::https(&CLOUDFLARE),
-        TokioRuntimeProvider::default(),
-    )
-    .build()
-    .context("failed to initialize DNS-over-HTTPS resolver")?;
+    let resolver =
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), ResolverOpts::default());
 
     let state = AppState {
         config: config.clone(),
@@ -266,7 +261,7 @@ async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<Tcp
 }
 
 async fn connect_via_doh(
-    resolver: &TokioResolver,
+    resolver: &TokioAsyncResolver,
     host: &str,
     port: u16,
     connect_timeout: Duration,
@@ -291,7 +286,7 @@ async fn connect_via_doh(
 }
 
 async fn lookup_ech_configs(
-    resolver: &TokioResolver,
+    resolver: &TokioAsyncResolver,
     domain: &str,
     port: u16,
 ) -> Result<Vec<EchConfigListBytes<'static>>> {
@@ -308,15 +303,15 @@ async fn lookup_ech_configs(
 
     let mut ech_lists = Vec::new();
 
-    for answer in lookup.answers() {
-        let RData::HTTPS(svcb) = &answer.data else {
+    for answer in lookup.iter() {
+        let RData::HTTPS(svcb) = answer else {
             continue;
         };
 
-        if let Some((_, SvcParamValue::EchConfigList(value))) = svcb
-            .svc_params
+        if let Some((_, SvcParamValue::EchConfig(value))) = svcb
+            .svc_params()
             .iter()
-            .find(|(key, _)| *key == SvcParamKey::EchConfigList)
+            .find(|(key, _)| *key == SvcParamKey::EchConfig)
         {
             ech_lists.push(EchConfigListBytes::from(value.clone().0));
         }
