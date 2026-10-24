@@ -1,0 +1,20 @@
+[package]
+name = "slipnet-ech-relay"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Fail-closed ECH WebSocket relay for SlipNet ParsPack routes"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "https-aws-lc-rs", "webpki-roots"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "logging", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-rustls = "0.26.6"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+webpki-roots = "1"
