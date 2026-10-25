@@ -46,12 +46,12 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const SERVICE: &str = "slipnet-ech-relay";
+const SERVICE: &str = "slipnet-ech-relay-r1";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PUBLIC_RELAY_PATH: &str = "/p/92943149c56048dda2b2123e591f9e7de9d79ae7d0d086db";
 const DEFAULT_WORKER_HOST: &str =
-    "slipnet-route3-c-20261024t182334z.edgebackup-77bd94daf93c.workers.dev";
-const DEFAULT_WORKER_PATH: &str = "/f/dcd6903ab84475e65a296be5aeb7a895ac62cb0ca9ec3b9e";
+    "slipnet-route1-a-20261024t182334z.edgecache-628bbe41dc.workers.dev";
+const DEFAULT_WORKER_PATH: &str = "/o/2eb8ae8480741e9c9fc01cb5fa2b4550d2650e48c6e2e437";
 
 #[derive(Clone, Debug)]
 struct Config {
