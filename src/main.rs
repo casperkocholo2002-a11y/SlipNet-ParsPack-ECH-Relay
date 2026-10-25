@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
@@ -27,7 +32,11 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use serde::Serialize;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    sync::RwLock,
+    time::{sleep, timeout},
+};
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_tungstenite::{
     client_async,
@@ -95,14 +104,21 @@ impl Config {
 }
 
 #[derive(Clone)]
+struct Bootstrap {
+    ech_lists: Vec<EchConfigListBytes<'static>>,
+    ips: Vec<IpAddr>,
+}
+
+#[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    resolvers: Arc<Vec<TokioAsyncResolver>>,
+    bootstrap: Arc<RwLock<Option<Bootstrap>>>,
 }
 
 #[derive(Serialize)]
 struct Health {
     ok: bool,
+    ready: bool,
     service: &'static str,
     version: &'static str,
     ech_mode: &'static str,
@@ -123,15 +139,43 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_env()?);
 
-    let resolvers = vec![
+    let resolvers = Arc::new(vec![
         TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), ResolverOpts::default()),
         TokioAsyncResolver::tokio(ResolverConfig::google_https(), ResolverOpts::default()),
         TokioAsyncResolver::tokio(ResolverConfig::quad9_https(), ResolverOpts::default()),
-    ];
+    ]);
+    let bootstrap = Arc::new(RwLock::new(None));
+
+    {
+        let resolvers = resolvers.clone();
+        let config = config.clone();
+        let bootstrap = bootstrap.clone();
+        tokio::spawn(async move {
+            loop {
+                let had_cache = bootstrap.read().await.is_some();
+                let delay = match resolve_bootstrap(&resolvers, &config).await {
+                    Ok(next) => {
+                        *bootstrap.write().await = Some(next);
+                        info!("encrypted DNS bootstrap cache refreshed");
+                        Duration::from_secs(120)
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "encrypted DNS bootstrap refresh failed");
+                        if had_cache {
+                            Duration::from_secs(15)
+                        } else {
+                            Duration::from_secs(5)
+                        }
+                    }
+                };
+                sleep(delay).await;
+            }
+        });
+    }
 
     let state = AppState {
         config: config.clone(),
-        resolvers: Arc::new(resolvers),
+        bootstrap,
     };
 
     let app = Router::new()
@@ -162,13 +206,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<Health> {
+async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         ok: true,
+        ready: state.bootstrap.read().await.is_some(),
         service: SERVICE,
         version: VERSION,
         ech_mode: "hard",
-        dns: "encrypted-doh-failover",
+        dns: "encrypted-doh-cached",
     })
 }
 
@@ -199,43 +244,23 @@ async fn relay_session(client: WebSocket, state: AppState) -> Result<()> {
 }
 
 async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
-    let mut attempts = FuturesUnordered::new();
-
-    for resolver in state.resolvers.iter() {
-        let cfg = state.config.clone();
-        attempts.push(async move { open_upstream_with_resolver(resolver, &cfg).await });
-    }
-
-    let mut errors = Vec::new();
-
-    while let Some(result) = attempts.next().await {
-        match result {
-            Ok(ws) => return Ok(ws),
-            Err(err) => errors.push(err.to_string()),
+    let cfg = &state.config;
+    let bootstrap = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(bootstrap) = state.bootstrap.read().await.clone() {
+                break bootstrap;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
-    }
-
-    bail!(
-        "all encrypted DNS upstream attempts failed: {}",
-        errors.join(" | ")
-    )
-}
-
-async fn open_upstream_with_resolver(
-    resolver: &TokioAsyncResolver,
-    cfg: &Config,
-) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
-    let ech_lists = timeout(
-        cfg.connect_timeout,
-        lookup_ech_configs(resolver, &cfg.worker_host, cfg.worker_port),
-    )
+    })
     .await
-    .context("ECH DNS lookup timed out")??;
+    .context("encrypted DNS bootstrap cache did not become ready")?;
 
-    let ech_config = ech_lists
+    let ech_config = bootstrap
+        .ech_lists
         .into_iter()
         .find_map(|list| EchConfig::new(list, ALL_SUPPORTED_SUITES).ok())
-        .ok_or_else(|| anyhow!("no compatible ECHConfigList returned by DNS-over-HTTPS"))?;
+        .ok_or_else(|| anyhow!("cached ECHConfigList is no longer compatible"))?;
 
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -246,14 +271,7 @@ async fn open_upstream_with_resolver(
         .with_root_certificates(roots)
         .with_no_client_auth();
 
-    let tcp = connect_via_doh(
-        resolver,
-        &cfg.worker_host,
-        cfg.worker_port,
-        cfg.connect_timeout,
-    )
-    .await?;
-
+    let tcp = connect_cached_ips(&bootstrap.ips, cfg.worker_port, cfg.connect_timeout).await?;
     tcp.set_nodelay(true).ok();
 
     let server_name = ServerName::try_from(cfg.worker_host.clone())
@@ -295,29 +313,74 @@ async fn open_upstream_with_resolver(
     Ok(ws)
 }
 
-async fn connect_via_doh(
+async fn resolve_bootstrap(resolvers: &[TokioAsyncResolver], cfg: &Config) -> Result<Bootstrap> {
+    let mut attempts = FuturesUnordered::new();
+
+    for resolver in resolvers {
+        attempts.push(resolve_bootstrap_with_resolver(resolver, cfg));
+    }
+
+    let mut errors = Vec::new();
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(bootstrap) => return Ok(bootstrap),
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+
+    bail!(
+        "all encrypted DNS bootstrap attempts failed: {}",
+        errors.join(" | ")
+    )
+}
+
+async fn resolve_bootstrap_with_resolver(
     resolver: &TokioAsyncResolver,
-    host: &str,
+    cfg: &Config,
+) -> Result<Bootstrap> {
+    let bootstrap_timeout = Duration::from_secs(20);
+
+    let ech_lists = timeout(
+        bootstrap_timeout,
+        lookup_ech_configs(resolver, &cfg.worker_host, cfg.worker_port),
+    )
+    .await
+    .context("ECH DNS bootstrap timed out")??;
+
+    if !ech_lists
+        .iter()
+        .cloned()
+        .any(|list| EchConfig::new(list, ALL_SUPPORTED_SUITES).is_ok())
+    {
+        bail!("encrypted DNS returned no compatible ECHConfigList");
+    }
+
+    let lookup = timeout(bootstrap_timeout, resolver.lookup_ip(&cfg.worker_host))
+        .await
+        .context("encrypted address bootstrap timed out")?
+        .context("encrypted address bootstrap failed")?;
+
+    let mut ips: Vec<IpAddr> = lookup.iter().collect();
+    ips.sort_by_key(|ip| ip.is_ipv6());
+    ips.dedup();
+
+    if ips.is_empty() {
+        bail!("encrypted DNS bootstrap returned no usable IP address");
+    }
+
+    Ok(Bootstrap { ech_lists, ips })
+}
+
+async fn connect_cached_ips(
+    ips: &[IpAddr],
     port: u16,
     connect_timeout: Duration,
 ) -> Result<TcpStream> {
-    let lookup = timeout(connect_timeout, resolver.lookup_ip(host))
-        .await
-        .context("DoH address lookup timed out")?
-        .context("DoH address lookup failed")?;
-
-    let mut ips: Vec<_> = lookup.iter().collect();
-    ips.sort_by_key(|ip| ip.is_ipv6());
-
-    if ips.is_empty() {
-        bail!("DoH returned no usable IP address");
-    }
-
     let per_ip_timeout = connect_timeout.min(Duration::from_secs(2));
     let mut errors = Vec::new();
 
     for ip in ips {
-        let addr = SocketAddr::new(ip, port);
+        let addr = SocketAddr::new(*ip, port);
         match timeout(per_ip_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(err)) => errors.push(format!("{addr}: {err}")),
@@ -326,7 +389,7 @@ async fn connect_via_doh(
     }
 
     bail!(
-        "all resolved IP connection attempts failed: {}",
+        "all cached IP connection attempts failed: {}",
         errors.join(" | ")
     )
 }
