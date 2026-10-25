@@ -306,30 +306,23 @@ async fn connect_via_doh(
         .context("DoH address lookup timed out")?
         .context("DoH address lookup failed")?;
 
-    let mut attempts = FuturesUnordered::new();
+    let mut ips: Vec<_> = lookup.iter().collect();
+    ips.sort_by_key(|ip| ip.is_ipv6());
 
-    for ip in lookup.iter() {
-        let addr = SocketAddr::new(ip, port);
-        attempts.push(async move {
-            match timeout(connect_timeout, TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => Ok(stream),
-                Ok(Err(err)) => Err(anyhow!("{addr}: {err}")),
-                Err(_) => Err(anyhow!("{addr}: connect timed out")),
-            }
-        });
+    if ips.is_empty() {
+        bail!("DoH returned no usable IP address");
     }
 
+    let per_ip_timeout = connect_timeout.min(Duration::from_secs(2));
     let mut errors = Vec::new();
 
-    while let Some(result) = attempts.next().await {
-        match result {
-            Ok(stream) => return Ok(stream),
-            Err(err) => errors.push(err.to_string()),
+    for ip in ips {
+        let addr = SocketAddr::new(ip, port);
+        match timeout(per_ip_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(err)) => errors.push(format!("{addr}: {err}")),
+            Err(_) => errors.push(format!("{addr}: connect timed out")),
         }
-    }
-
-    if errors.is_empty() {
-        bail!("DoH returned no usable IP address");
     }
 
     bail!(
