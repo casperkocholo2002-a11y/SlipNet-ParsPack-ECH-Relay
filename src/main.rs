@@ -67,18 +67,13 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let port = env_u16("PORT", 8080)?;
-        let public_relay_path =
-            env::var("PUBLIC_RELAY_PATH").unwrap_or_else(|_| DEFAULT_PUBLIC_RELAY_PATH.to_owned());
+        let public_relay_path = DEFAULT_PUBLIC_RELAY_PATH.to_owned();
         validate_path("PUBLIC_RELAY_PATH", &public_relay_path)?;
-        let worker_host = env::var("WORKER_HOST")
-            .unwrap_or_else(|_| DEFAULT_WORKER_HOST.to_owned())
-            .trim()
-            .to_owned();
+        let worker_host = DEFAULT_WORKER_HOST.to_owned();
         validate_host(&worker_host)?;
-        let worker_path =
-            env::var("WORKER_PATH").unwrap_or_else(|_| DEFAULT_WORKER_PATH.to_owned());
+        let worker_path = DEFAULT_WORKER_PATH.to_owned();
         validate_path("WORKER_PATH", &worker_path)?;
-        let worker_port = env_u16("WORKER_PORT", 443)?;
+        let worker_port = 443;
         let connect_timeout = Duration::from_millis(env_u64("CONNECT_TIMEOUT_MS", 6000)?);
         let max_message_size = env_usize("MAX_MESSAGE_BYTES", 64 * 1024 * 1024)?;
 
