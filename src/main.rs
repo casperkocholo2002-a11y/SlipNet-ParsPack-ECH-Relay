@@ -332,18 +332,36 @@ async fn connect_via_doh(
         .context("DoH address lookup timed out")?
         .context("DoH address lookup failed")?;
 
-    let mut last_error = None;
+    let mut attempts = FuturesUnordered::new();
 
     for ip in lookup.iter() {
         let addr = SocketAddr::new(ip, port);
-        match timeout(connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(err)) => last_error = Some(anyhow!("{addr}: {err}")),
-            Err(_) => last_error = Some(anyhow!("{addr}: connect timed out")),
+        attempts.push(async move {
+            match timeout(connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => Ok(stream),
+                Ok(Err(err)) => Err(anyhow!("{addr}: {err}")),
+                Err(_) => Err(anyhow!("{addr}: connect timed out")),
+            }
+        });
+    }
+
+    let mut errors = Vec::new();
+
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(err) => errors.push(err.to_string()),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("DoH returned no usable IP address")))
+    if errors.is_empty() {
+        bail!("DoH returned no usable IP address");
+    }
+
+    bail!(
+        "all resolved IP connection attempts failed: {}",
+        errors.join(" | ")
+    )
 }
 
 async fn lookup_ech_configs(
