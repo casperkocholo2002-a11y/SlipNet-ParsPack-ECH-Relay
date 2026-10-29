@@ -33,7 +33,7 @@ use rustls::{
 };
 use serde::Serialize;
 use tokio::{
-    net::TcpStream,
+    net::{lookup_host, TcpStream},
     sync::RwLock,
     time::{sleep, timeout},
 };
@@ -136,7 +136,24 @@ async fn main() -> Result<()> {
         TokioAsyncResolver::tokio(ResolverConfig::google_https(), ResolverOpts::default()),
         TokioAsyncResolver::tokio(ResolverConfig::quad9_https(), ResolverOpts::default()),
     ]);
-    let bootstrap = Arc::new(RwLock::new(None));
+    let initial_bootstrap = match resolve_system_bootstrap(&config).await {
+        Ok(bootstrap) => {
+            info!(
+                upstream = %config.worker_host,
+                "system DNS bootstrap ready; ECH discovery will continue in background"
+            );
+            Some(bootstrap)
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                upstream = %config.worker_host,
+                "system DNS bootstrap failed; waiting for encrypted DNS bootstrap"
+            );
+            None
+        }
+    };
+    let bootstrap = Arc::new(RwLock::new(initial_bootstrap));
 
     {
         let resolvers = resolvers.clone();
@@ -205,7 +222,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         service: SERVICE,
         version: VERSION,
         ech_mode: "optional",
-        dns: "encrypted-doh-cached",
+        dns: "system-ready-doh-upgrade",
     })
 }
 
@@ -368,6 +385,29 @@ async fn open_websocket(
     }
 
     Ok(ws)
+}
+
+async fn resolve_system_bootstrap(cfg: &Config) -> Result<Bootstrap> {
+    let lookup = timeout(
+        cfg.connect_timeout,
+        lookup_host((cfg.worker_host.as_str(), cfg.worker_port)),
+    )
+    .await
+    .context("system DNS lookup timed out")?
+    .context("system DNS lookup failed")?;
+
+    let mut ips: Vec<IpAddr> = lookup.map(|addr| addr.ip()).collect();
+    ips.sort_by_key(|ip| ip.is_ipv6());
+    ips.dedup();
+
+    if ips.is_empty() {
+        bail!("system DNS bootstrap returned no usable IP address");
+    }
+
+    Ok(Bootstrap {
+        ech_lists: Vec::new(),
+        ips,
+    })
 }
 
 async fn resolve_bootstrap(resolvers: &[TokioAsyncResolver], cfg: &Config) -> Result<Bootstrap> {
