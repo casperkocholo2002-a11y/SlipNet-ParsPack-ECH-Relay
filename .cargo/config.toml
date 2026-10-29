@@ -1,5 +1,8 @@
 [source.crates-io]
-replace-with = "github-sparse"
+replace-with = "local-registry"
 
-[source.github-sparse]
-registry = "sparse+https://raw.githubusercontent.com/rust-lang/crates.io-index/master/"
+[source.local-registry]
+local-registry = "local-registry"
+
+[net]
+offline = true
