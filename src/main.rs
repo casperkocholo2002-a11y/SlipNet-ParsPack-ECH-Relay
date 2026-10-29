@@ -49,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 const SERVICE: &str = "slipnet-ech-relay";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PUBLIC_RELAY_PATH: &str = "/p/92943149c56048dda2b2123e591f9e7de9d79ae7d0d086db";
+const LEGACY_PUBLIC_RELAY_PATH: &str = "/pf/d9b9b6e3aee49cb4b71687404a911c20626846fc8ae14f01";
 const DEFAULT_WORKER_HOST: &str =
     "slipnet-route3-c-20261024t182334z.edgebackup-77bd94daf93c.workers.dev";
 const DEFAULT_WORKER_PATH: &str = "/f/dcd6903ab84475e65a296be5aeb7a895ac62cb0ca9ec3b9e";
@@ -192,11 +193,15 @@ async fn main() -> Result<()> {
         bootstrap,
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
-        .route(&config.public_relay_path, get(relay_upgrade))
-        .fallback(not_found)
-        .with_state(state);
+        .route(&config.public_relay_path, get(relay_upgrade));
+
+    if config.public_relay_path != LEGACY_PUBLIC_RELAY_PATH {
+        app = app.route(LEGACY_PUBLIC_RELAY_PATH, get(relay_upgrade));
+    }
+
+    let app = app.fallback(not_found).with_state(state);
 
     let bind = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(bind)
