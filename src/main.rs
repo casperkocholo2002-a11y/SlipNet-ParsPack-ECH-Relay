@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
@@ -77,11 +77,8 @@ impl Config {
         let connect_timeout = Duration::from_millis(env_u64("CONNECT_TIMEOUT_MS", 6000)?);
         let max_message_size = env_usize("MAX_MESSAGE_BYTES", 64 * 1024 * 1024)?;
 
-        let ech_mode = env::var("ECH_MODE").unwrap_or_else(|_| "hard".to_owned());
-        if ech_mode != "hard" {
-            bail!("ECH_MODE must be exactly 'hard'; plaintext-SNI fallback is intentionally unsupported");
-        }
-
+        // ECH is preferred, but availability on the upstream CDN can change.
+        // If ECH is absent or rejected, the relay falls back to normal TLS.
         if public_relay_path == "/health" {
             bail!("PUBLIC_RELAY_PATH must not be /health");
         }
@@ -189,7 +186,7 @@ async fn main() -> Result<()> {
         version = VERSION,
         port = config.port,
         relay_path_configured = true,
-        ech_mode = "hard",
+        ech_mode = "optional",
         "SlipNet ECH relay started"
     );
 
@@ -207,7 +204,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         ready: state.bootstrap.read().await.is_some(),
         service: SERVICE,
         version: VERSION,
-        ech_mode: "hard",
+        ech_mode: "optional",
         dns: "encrypted-doh-cached",
     })
 }
@@ -231,8 +228,7 @@ async fn relay_session(client: WebSocket, state: AppState) -> Result<()> {
 
     info!(
         upstream = %state.config.worker_host,
-        ech = "accepted",
-        "upstream ECH WebSocket established"
+        "upstream WebSocket established"
     );
 
     bridge(client, upstream).await
@@ -251,14 +247,51 @@ async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<Tcp
     .await
     .context("encrypted DNS bootstrap cache did not become ready")?;
 
-    let ech_config = bootstrap
+    if let Some(ech_config) = bootstrap
         .ech_lists
-        .into_iter()
+        .iter()
+        .cloned()
         .find_map(|list| EchConfig::new(list, ALL_SUPPORTED_SUITES).ok())
-        .ok_or_else(|| anyhow!("cached ECHConfigList is no longer compatible"))?;
+    {
+        match open_upstream_ech(cfg, &bootstrap, ech_config).await {
+            Ok(ws) => {
+                info!(
+                    upstream = %cfg.worker_host,
+                    ech = "accepted",
+                    "upstream ECH WebSocket established"
+                );
+                return Ok(ws);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    upstream = %cfg.worker_host,
+                    "ECH failed; falling back to normal TLS"
+                );
+            }
+        }
+    } else {
+        info!(
+            upstream = %cfg.worker_host,
+            "no compatible ECHConfigList; using normal TLS fallback"
+        );
+    }
 
+    let ws = open_upstream_plain(cfg, &bootstrap).await?;
+    info!(
+        upstream = %cfg.worker_host,
+        ech = "fallback",
+        "upstream TLS WebSocket established without ECH"
+    );
+    Ok(ws)
+}
+
+async fn open_upstream_ech(
+    cfg: &Config,
+    bootstrap: &Bootstrap,
+    ech_config: EchConfig,
+) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let tls_config = ClientConfig::builder_with_provider(provider)
         .with_ech(EchMode::from(ech_config))
@@ -271,7 +304,6 @@ async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<Tcp
 
     let server_name = ServerName::try_from(cfg.worker_host.clone())
         .context("WORKER_HOST is not a valid DNS name")?;
-
     let connector = TlsConnector::from(Arc::new(tls_config));
     let tls = timeout(cfg.connect_timeout, connector.connect(server_name, tcp))
         .await
@@ -280,9 +312,39 @@ async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<Tcp
 
     let ech_status = tls.get_ref().1.ech_status();
     if ech_status != EchStatus::Accepted {
-        bail!("ECH hard-fail: server did not accept ECH (status={ech_status:?})");
+        bail!("server did not accept ECH (status={ech_status:?})");
     }
 
+    open_websocket(cfg, tls).await
+}
+
+async fn open_upstream_plain(
+    cfg: &Config,
+    bootstrap: &Bootstrap,
+) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
+    let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let tcp = connect_cached_ips(&bootstrap.ips, cfg.worker_port, cfg.connect_timeout).await?;
+    tcp.set_nodelay(true).ok();
+
+    let server_name = ServerName::try_from(cfg.worker_host.clone())
+        .context("WORKER_HOST is not a valid DNS name")?;
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let tls = timeout(cfg.connect_timeout, connector.connect(server_name, tcp))
+        .await
+        .context("TLS fallback handshake timed out")?
+        .context("TLS fallback handshake failed")?;
+
+    open_websocket(cfg, tls).await
+}
+
+async fn open_websocket(
+    cfg: &Config,
+    tls: TlsStream<TcpStream>,
+) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
     let url = format!(
         "wss://{}:{}{}",
         cfg.worker_host, cfg.worker_port, cfg.worker_path
@@ -335,20 +397,29 @@ async fn resolve_bootstrap_with_resolver(
 ) -> Result<Bootstrap> {
     let bootstrap_timeout = Duration::from_secs(20);
 
-    let ech_lists = timeout(
+    let ech_lists = match timeout(
         bootstrap_timeout,
         lookup_ech_configs(resolver, &cfg.worker_host, cfg.worker_port),
     )
     .await
-    .context("ECH DNS bootstrap timed out")??;
-
-    if !ech_lists
-        .iter()
-        .cloned()
-        .any(|list| EchConfig::new(list, ALL_SUPPORTED_SUITES).is_ok())
     {
-        bail!("encrypted DNS returned no compatible ECHConfigList");
-    }
+        Ok(Ok(lists)) => lists,
+        Ok(Err(err)) => {
+            warn!(
+                error = %err,
+                upstream = %cfg.worker_host,
+                "ECH DNS lookup unavailable; normal TLS fallback remains available"
+            );
+            Vec::new()
+        }
+        Err(_) => {
+            warn!(
+                upstream = %cfg.worker_host,
+                "ECH DNS lookup timed out; normal TLS fallback remains available"
+            );
+            Vec::new()
+        }
+    };
 
     let lookup = timeout(bootstrap_timeout, resolver.lookup_ip(&cfg.worker_host))
         .await
