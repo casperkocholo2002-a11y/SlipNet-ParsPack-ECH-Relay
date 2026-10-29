@@ -46,12 +46,12 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-const SERVICE: &str = "slipnet-ech-relay";
+const SERVICE: &str = "slipnet-ech-relay-r1";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PUBLIC_RELAY_PATH: &str = "/p/92943149c56048dda2b2123e591f9e7de9d79ae7d0d086db";
 const DEFAULT_WORKER_HOST: &str =
-    "slipnet-route3-c-20261024t182334z.edgebackup-77bd94daf93c.workers.dev";
-const DEFAULT_WORKER_PATH: &str = "/f/dcd6903ab84475e65a296be5aeb7a895ac62cb0ca9ec3b9e";
+    "slipnet-route1-a-20261024t182334z.edgecache-628bbe41dc.workers.dev";
+const DEFAULT_WORKER_PATH: &str = "/o/2eb8ae8480741e9c9fc01cb5fa2b4550d2650e48c6e2e437";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -67,18 +67,13 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let port = env_u16("PORT", 8080)?;
-        let public_relay_path =
-            env::var("PUBLIC_RELAY_PATH").unwrap_or_else(|_| DEFAULT_PUBLIC_RELAY_PATH.to_owned());
+        let public_relay_path = DEFAULT_PUBLIC_RELAY_PATH.to_owned();
         validate_path("PUBLIC_RELAY_PATH", &public_relay_path)?;
-        let worker_host = env::var("WORKER_HOST")
-            .unwrap_or_else(|_| DEFAULT_WORKER_HOST.to_owned())
-            .trim()
-            .to_owned();
+        let worker_host = DEFAULT_WORKER_HOST.to_owned();
         validate_host(&worker_host)?;
-        let worker_path =
-            env::var("WORKER_PATH").unwrap_or_else(|_| DEFAULT_WORKER_PATH.to_owned());
+        let worker_path = DEFAULT_WORKER_PATH.to_owned();
         validate_path("WORKER_PATH", &worker_path)?;
-        let worker_port = env_u16("WORKER_PORT", 443)?;
+        let worker_port = 443;
         let connect_timeout = Duration::from_millis(env_u64("CONNECT_TIMEOUT_MS", 6000)?);
         let max_message_size = env_usize("MAX_MESSAGE_BYTES", 64 * 1024 * 1024)?;
 
