@@ -7,8 +7,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use aws_lc_rs::{
-    digest,
-    hmac,
+    digest, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use axum::{
@@ -25,8 +24,7 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
-const DEFAULT_TELEMETRY_URL: &str =
-    "https://monitor.reoos.ir/api/direct-session/telemetry";
+const DEFAULT_TELEMETRY_URL: &str = "https://monitor.reoos.ir/api/direct-session/telemetry";
 const HEARTBEAT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_millis(1800);
 const INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,15 +81,12 @@ impl SessionGuard {
             .unwrap_or_else(|_| default_route.to_owned())
             .trim()
             .to_ascii_lowercase();
-        if !matches!(
-            route.as_str(),
-            "direct-r1" | "direct-r2" | "direct-r3"
-        ) {
+        if !matches!(route.as_str(), "direct-r1" | "direct-r2" | "direct-r3") {
             bail!("invalid CONCURRENCY_ROUTE");
         }
 
-        let telemetry_url = env::var("SESSION_TELEMETRY_URL")
-            .unwrap_or_else(|_| DEFAULT_TELEMETRY_URL.to_owned());
+        let telemetry_url =
+            env::var("SESSION_TELEMETRY_URL").unwrap_or_else(|_| DEFAULT_TELEMETRY_URL.to_owned());
         parse_https_url(&telemetry_url).context("invalid SESSION_TELEMETRY_URL")?;
 
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -185,10 +180,7 @@ impl SessionGuard {
             return None;
         }
 
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs() as i64;
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
         let proof = telemetry_proof(
             &meta.uuid,
             &meta.uuid_hash,
@@ -370,9 +362,7 @@ fn telemetry_proof(
     ts: i64,
     session_id: &str,
 ) -> String {
-    let message = format!(
-        "{uuid_hash}|{source_ip}|{route}|{event}|{ts}|{session_id}"
-    );
+    let message = format!("{uuid_hash}|{source_ip}|{route}|{event}|{ts}|{session_id}");
     let key = hmac::Key::new(hmac::HMAC_SHA256, uuid.as_bytes());
     let tag = hmac::sign(&key, message.as_bytes());
     hex_bytes(tag.as_ref())
@@ -458,8 +448,8 @@ mod tests {
     fn extracts_uuid_from_vless_header() {
         let mut header = vec![0u8];
         header.extend_from_slice(&[
-            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33,
-            0x84, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
         ]);
         assert_eq!(
             uuid_from_header(&header).as_deref(),
@@ -480,8 +470,7 @@ mod tests {
     #[test]
     fn proof_matches_backend_contract() {
         let uuid = "11111111-2222-4333-8444-555555555555";
-        let uuid_hash =
-            "cf4c4732fd3b8f8a55b60871950a2f22c893ea7afd75d2146826534e3f67cc49";
+        let uuid_hash = "cf4c4732fd3b8f8a55b60871950a2f22c893ea7afd75d2146826534e3f67cc49";
         assert_eq!(
             telemetry_proof(
                 uuid,
