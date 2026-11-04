@@ -7,7 +7,7 @@ license = "MIT"
 description = "Fail-closed ECH WebSocket relay for SlipNet ParsPack routes"
 
 [dependencies]
-aws-lc-rs = "=1.18.2"
+aws-lc-rs = { version = "=1.18.2", default-features = false }
 anyhow = "1.0"
 axum = { version = "=0.7.9", features = ["ws"] }
 futures-util = "0.3"
