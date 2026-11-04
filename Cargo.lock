@@ -1095,12 +1095,14 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slipnet-ech-relay"
 version = "1.0.13"
 dependencies = [
+ "aws-lc-rs",
  "anyhow",
  "axum",
  "futures-util",
  "hickory-resolver",
  "rustls 0.23.46",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-tungstenite",
