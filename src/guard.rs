@@ -1,6 +1,6 @@
 use std::{
     env,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
