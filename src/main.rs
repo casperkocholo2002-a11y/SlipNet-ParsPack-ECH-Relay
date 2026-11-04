@@ -1,3 +1,5 @@
+mod guard;
+
 use std::{
     env,
     net::{IpAddr, SocketAddr},
@@ -11,7 +13,7 @@ use axum::{
         ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -111,6 +113,7 @@ struct Bootstrap {
 struct AppState {
     config: Arc<Config>,
     bootstrap: Arc<RwLock<Option<Bootstrap>>>,
+    guard: Arc<guard::SessionGuard>,
 }
 
 #[derive(Serialize)]
@@ -121,6 +124,8 @@ struct Health {
     version: &'static str,
     ech_mode: &'static str,
     dns: &'static str,
+    concurrency_guard: bool,
+    concurrency_route: String,
 }
 
 #[tokio::main]
@@ -136,6 +141,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
+    let guard = Arc::new(guard::SessionGuard::new("direct-r3")?);
 
     let resolvers = Arc::new(vec![
         TokioAsyncResolver::tokio(ResolverConfig::cloudflare_https(), ResolverOpts::default()),
@@ -191,6 +197,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         config: config.clone(),
         bootstrap,
+        guard,
     };
 
     let mut app = Router::new()
@@ -233,6 +240,8 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         version: VERSION,
         ech_mode: "optional",
         dns: "system-ready-doh-upgrade",
+        concurrency_guard: state.guard.enabled(),
+        concurrency_route: state.guard.route().to_owned(),
     })
 }
 
@@ -240,25 +249,50 @@ async fn not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "not_found")
 }
 
-async fn relay_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+async fn relay_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     let max_message_size = state.config.max_message_size;
+    let source_ip = guard::source_ip(&headers);
     ws.max_message_size(max_message_size)
         .on_upgrade(move |socket| async move {
-            if let Err(err) = relay_session(socket, state).await {
+            if let Err(err) = relay_session(socket, state, source_ip).await {
                 warn!(error = %err, "relay session ended with error");
             }
         })
 }
 
-async fn relay_session(client: WebSocket, state: AppState) -> Result<()> {
-    let upstream = open_upstream(&state).await?;
+async fn relay_session(
+    mut client: WebSocket,
+    state: AppState,
+    source_ip: Option<String>,
+) -> Result<()> {
+    let mut upstream = open_upstream(&state).await?;
 
     info!(
         upstream = %state.config.worker_host,
         "upstream WebSocket established"
     );
 
-    bridge(client, upstream).await
+    let start = state.guard.begin(&mut client, source_ip).await?;
+    if start.locked {
+        bail!("concurrency_locked");
+    }
+    for message in start.buffered {
+        if let Some(message) = axum_to_tungstenite(message) {
+            upstream
+                .send(message)
+                .await
+                .context("failed forwarding guarded initial payload")?;
+        }
+    }
+    let guard_ctx = start
+        .meta
+        .map(|meta| (state.guard.clone(), meta));
+
+    bridge(client, upstream, guard_ctx).await
 }
 
 async fn open_upstream(state: &AppState) -> Result<WebSocketStream<TlsStream<TcpStream>>> {
@@ -554,7 +588,11 @@ async fn lookup_ech_configs(
     Ok(ech_lists)
 }
 
-async fn bridge(client: WebSocket, upstream: WebSocketStream<TlsStream<TcpStream>>) -> Result<()> {
+async fn bridge(
+    client: WebSocket,
+    upstream: WebSocketStream<TlsStream<TcpStream>>,
+    guard_ctx: Option<(Arc<guard::SessionGuard>, guard::SessionMeta)>,
+) -> Result<()> {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
 
@@ -592,12 +630,26 @@ async fn bridge(client: WebSocket, upstream: WebSocketStream<TlsStream<TcpStream
         Result::<()>::Ok(())
     };
 
-    tokio::select! {
-        result = client_to_upstream => result?,
-        result = upstream_to_client => result?,
-    }
+    let heartbeat_ctx = guard_ctx.clone();
+    let close_ctx = guard_ctx;
+    let guard_watch = async move {
+        if let Some((guard, meta)) = heartbeat_ctx {
+            guard.watch(meta).await
+        } else {
+            std::future::pending::<Result<()>>().await
+        }
+    };
 
-    Ok(())
+    let result = tokio::select! {
+        result = client_to_upstream => result,
+        result = upstream_to_client => result,
+        result = guard_watch => result,
+    };
+
+    if let Some((guard, meta)) = close_ctx {
+        guard.close_async(meta);
+    }
+    result
 }
 
 fn axum_to_tungstenite(message: AxumMessage) -> Option<TungsteniteMessage> {
