@@ -1,3 +1,5 @@
+mod guard;
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
@@ -6,7 +8,7 @@ use axum::{
         ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -37,7 +39,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
-struct AppState;
+struct AppState {
+    guard: Arc<guard::SessionGuard>,
+}
 
 #[derive(Serialize)]
 struct Health {
@@ -48,6 +52,8 @@ struct Health {
     ech: bool,
     upstream_tls: &'static str,
     route_mode: &'static str,
+    concurrency_guard: bool,
+    concurrency_route: String,
 }
 
 #[tokio::main]
@@ -62,11 +68,15 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
+    let state = AppState {
+        guard: Arc::new(guard::SessionGuard::new("direct-r2")?),
+    };
+
     let app = Router::new()
         .route("/health", get(health))
         .route(PUBLIC_RELAY_PATH, get(relay_upgrade))
         .fallback(not_found)
-        .with_state(AppState);
+        .with_state(state);
 
     let port = std::env::var("PORT")
         .ok()
@@ -93,7 +103,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<Health> {
+async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         ok: true,
         ready: true,
@@ -102,6 +112,8 @@ async fn health() -> Json<Health> {
         ech: false,
         upstream_tls: "strict",
         route_mode: "worker-b-direct-with-fixed-origin-fallback",
+        concurrency_guard: state.guard.enabled(),
+        concurrency_route: state.guard.route().to_owned(),
     })
 }
 
@@ -109,17 +121,26 @@ async fn not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "not_found")
 }
 
-async fn relay_upgrade(ws: WebSocketUpgrade, State(_): State<AppState>) -> Response {
+async fn relay_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let source_ip = guard::source_ip(&headers);
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| async move {
-            if let Err(err) = relay_session(socket).await {
+            if let Err(err) = relay_session(socket, state, source_ip).await {
                 warn!(error = %err, "route2 relay session ended with error");
             }
         })
 }
 
-async fn relay_session(client: WebSocket) -> Result<()> {
-    let upstream = open_upstream().await?;
+async fn relay_session(
+    mut client: WebSocket,
+    state: AppState,
+    source_ip: Option<String>,
+) -> Result<()> {
+    let mut upstream = open_upstream().await?;
 
     info!(
         upstream = WORKER_HOST,
@@ -127,7 +148,23 @@ async fn relay_session(client: WebSocket) -> Result<()> {
         "upstream standard TLS WebSocket established"
     );
 
-    bridge(client, upstream).await
+    let start = state.guard.begin(&mut client, source_ip).await?;
+    if start.locked {
+        bail!("concurrency_locked");
+    }
+    for message in start.buffered {
+        if let Some(message) = axum_to_tungstenite(message) {
+            upstream
+                .send(message)
+                .await
+                .context("failed forwarding guarded initial payload")?;
+        }
+    }
+    let guard_ctx = start
+        .meta
+        .map(|meta| (state.guard.clone(), meta));
+
+    bridge(client, upstream, guard_ctx).await
 }
 
 async fn open_upstream() -> Result<WebSocketStream<TlsStream<TcpStream>>> {
@@ -193,7 +230,11 @@ async fn connect_worker() -> Result<TcpStream> {
     )
 }
 
-async fn bridge(client: WebSocket, upstream: WebSocketStream<TlsStream<TcpStream>>) -> Result<()> {
+async fn bridge(
+    client: WebSocket,
+    upstream: WebSocketStream<TlsStream<TcpStream>>,
+    guard_ctx: Option<(Arc<guard::SessionGuard>, guard::SessionMeta)>,
+) -> Result<()> {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
 
@@ -231,12 +272,26 @@ async fn bridge(client: WebSocket, upstream: WebSocketStream<TlsStream<TcpStream
         Result::<()>::Ok(())
     };
 
-    tokio::select! {
-        result = client_to_upstream => result?,
-        result = upstream_to_client => result?,
-    }
+    let heartbeat_ctx = guard_ctx.clone();
+    let close_ctx = guard_ctx;
+    let guard_watch = async move {
+        if let Some((guard, meta)) = heartbeat_ctx {
+            guard.watch(meta).await
+        } else {
+            std::future::pending::<Result<()>>().await
+        }
+    };
 
-    Ok(())
+    let result = tokio::select! {
+        result = client_to_upstream => result,
+        result = upstream_to_client => result,
+        result = guard_watch => result,
+    };
+
+    if let Some((guard, meta)) = close_ctx {
+        guard.close_async(meta);
+    }
+    result
 }
 
 fn axum_to_tungstenite(message: AxumMessage) -> Option<TungsteniteMessage> {
