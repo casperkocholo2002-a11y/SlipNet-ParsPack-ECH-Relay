@@ -283,9 +283,7 @@ async fn relay_session(
                 .context("failed forwarding guarded initial payload")?;
         }
     }
-    let guard_ctx = start
-        .meta
-        .map(|meta| (state.guard.clone(), meta));
+    let guard_ctx = start.meta.map(|meta| (state.guard.clone(), meta));
 
     bridge(client, upstream, guard_ctx).await
 }
