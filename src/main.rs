@@ -1,6 +1,7 @@
 mod guard;
 
 use std::{
+    collections::BTreeMap,
     env,
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -128,6 +129,13 @@ struct Health {
     concurrency_route: String,
 }
 
+#[derive(Serialize)]
+struct RealIpDiag {
+    ok: bool,
+    parsed_source_ip: Option<String>,
+    headers: BTreeMap<String, String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -202,6 +210,7 @@ async fn main() -> Result<()> {
 
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/diag/realip", get(realip_diag))
         .route(&config.public_relay_path, get(relay_upgrade));
 
     if config.public_relay_path != LEGACY_PUBLIC_RELAY_PATH {
@@ -242,6 +251,39 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         dns: "system-ready-doh-upgrade",
         concurrency_guard: state.guard.enabled(),
         concurrency_route: state.guard.route().to_owned(),
+    })
+}
+
+async fn realip_diag(headers: HeaderMap) -> Json<RealIpDiag> {
+    let parsed_source_ip = guard::source_ip(&headers);
+    let mut captured = BTreeMap::new();
+
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "authorization"
+                | "cookie"
+                | "proxy-authorization"
+                | "sec-websocket-key"
+                | "sec-websocket-protocol"
+        ) {
+            continue;
+        }
+
+        captured.insert(
+            key,
+            value
+                .to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|_| "<non-utf8>".to_owned()),
+        );
+    }
+
+    Json(RealIpDiag {
+        ok: true,
+        parsed_source_ip,
+        headers: captured,
     })
 }
 
