@@ -257,7 +257,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         signed_realip_bridge: env::var("REALIP_BRIDGE_SECRET")
             .map(|value| value.len() >= 32)
             .unwrap_or(false),
-        build: "parspack-fixed-signed-realip-guardtest-v2",
+        build: "parspack-fixed-signed-realip-guardtest-v3",
     })
 }
 
