@@ -64,7 +64,7 @@ struct TelemetryResponse {
     #[serde(default)]
     active_sessions: usize,
     #[serde(default)]
-    reason: String,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,7 +212,7 @@ impl SessionGuard {
             locked: out.locked,
             active_sources: out.active_sources,
             active_sessions: out.active_sessions,
-            reason: out.reason,
+            reason: out.reason.unwrap_or_default(),
         })
     }
 
