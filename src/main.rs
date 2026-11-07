@@ -12,9 +12,9 @@ use anyhow::{bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode, Uri, Version},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -135,6 +135,10 @@ struct Health {
 struct RealIpDiag {
     ok: bool,
     parsed_source_ip: Option<String>,
+    peer_addr: String,
+    method: String,
+    uri: String,
+    http_version: String,
     headers: BTreeMap<String, String>,
 }
 
@@ -236,10 +240,13 @@ async fn main() -> Result<()> {
         "SlipNet ECH relay started"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("HTTP server failed")?;
 
     Ok(())
 }
@@ -257,11 +264,17 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         signed_realip_bridge: env::var("REALIP_BRIDGE_SECRET")
             .map(|value| value.len() >= 32)
             .unwrap_or(false),
-        build: "parspack-fixed-signed-realip-guardtest-v3",
+        build: "parspack-fixed-signed-realip-metadata-v4",
     })
 }
 
-async fn realip_diag(headers: HeaderMap) -> Json<RealIpDiag> {
+async fn realip_diag(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    version: Version,
+    headers: HeaderMap,
+) -> Json<RealIpDiag> {
     let parsed_source_ip = guard::source_ip(&headers);
     let mut captured = BTreeMap::new();
 
@@ -291,6 +304,10 @@ async fn realip_diag(headers: HeaderMap) -> Json<RealIpDiag> {
     Json(RealIpDiag {
         ok: true,
         parsed_source_ip,
+        peer_addr: peer_addr.to_string(),
+        method: method.to_string(),
+        uri: uri.to_string(),
+        http_version: format!("{version:?}"),
         headers: captured,
     })
 }
