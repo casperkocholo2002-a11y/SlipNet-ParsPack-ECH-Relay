@@ -254,7 +254,7 @@ pub fn source_ip(headers: &HeaderMap) -> Option<String> {
         return Some(ip);
     }
 
-    for name in ["x-real-ip", "x-client-ip", "ar-real-ip", "x-forwarded-for"] {
+    for name in ["x-real-ip", "x-client-ip", "ar-real-ip"] {
         let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
         };
@@ -266,6 +266,22 @@ pub fn source_ip(headers: &HeaderMap) -> Option<String> {
             }
         }
     }
+
+    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for candidate in value
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .rev()
+        {
+            if let Some(ip) = normalize_ip(candidate) {
+                if is_public_ip(&ip) {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+
     None
 }
 
