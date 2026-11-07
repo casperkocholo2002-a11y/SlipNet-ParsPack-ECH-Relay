@@ -59,6 +59,21 @@ struct TelemetryResponse {
     session_known: Option<bool>,
     #[serde(default)]
     locked: bool,
+    #[serde(default)]
+    active_sources: usize,
+    #[serde(default)]
+    active_sessions: usize,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GuardDiagResult {
+    pub known: bool,
+    pub locked: bool,
+    pub active_sources: usize,
+    pub active_sessions: usize,
+    pub reason: String,
 }
 
 #[derive(Serialize)]
@@ -173,6 +188,32 @@ impl SessionGuard {
         tokio::spawn(async move {
             let _ = guard.emit(&meta, "close").await;
         });
+    }
+
+    pub async fn diag_event(
+        &self,
+        uuid: &str,
+        source_ip: &str,
+        session_id: &str,
+        event: &str,
+    ) -> Option<GuardDiagResult> {
+        if !matches!(event, "open" | "heartbeat" | "close") {
+            return None;
+        }
+        let meta = SessionMeta {
+            uuid: uuid.to_ascii_lowercase(),
+            uuid_hash: sha256_hex(uuid.to_ascii_lowercase().as_bytes()),
+            source_ip: source_ip.to_owned(),
+            session_id: session_id.to_owned(),
+        };
+        let out = self.emit(&meta, event).await?;
+        Some(GuardDiagResult {
+            known: out.known,
+            locked: out.locked,
+            active_sources: out.active_sources,
+            active_sessions: out.active_sessions,
+            reason: out.reason,
+        })
     }
 
     async fn emit(&self, meta: &SessionMeta, event: &str) -> Option<TelemetryResponse> {
