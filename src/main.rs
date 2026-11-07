@@ -127,6 +127,8 @@ struct Health {
     dns: &'static str,
     concurrency_guard: bool,
     concurrency_route: String,
+    signed_realip_bridge: bool,
+    build: &'static str,
 }
 
 #[derive(Serialize)]
@@ -251,6 +253,10 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         dns: "system-ready-doh-upgrade",
         concurrency_guard: state.guard.enabled(),
         concurrency_route: state.guard.route().to_owned(),
+        signed_realip_bridge: env::var("REALIP_BRIDGE_SECRET")
+            .map(|value| value.len() >= 32)
+            .unwrap_or(false),
+        build: "parspack-fixed-signed-realip-backend-v1",
     })
 }
 
@@ -267,6 +273,7 @@ async fn realip_diag(headers: HeaderMap) -> Json<RealIpDiag> {
                 | "proxy-authorization"
                 | "sec-websocket-key"
                 | "sec-websocket-protocol"
+                | "x-slipnet-real-ip-proof"
         ) {
             continue;
         }
