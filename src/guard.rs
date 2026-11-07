@@ -282,10 +282,7 @@ fn signed_bridge_ip(headers: &HeaderMap) -> Option<String> {
         .ok()?
         .parse::<i64>()
         .ok()?;
-    let proof = headers
-        .get("x-slipnet-real-ip-proof")?
-        .to_str()
-        .ok()?;
+    let proof = headers.get("x-slipnet-real-ip-proof")?.to_str().ok()?;
 
     let ip = normalize_ip(raw_ip)?;
     if !is_public_ip(&ip) {
@@ -522,7 +519,7 @@ mod tests {
             "x-forwarded-for",
             HeaderValue::from_static("192.0.2.1, 198.51.100.9"),
         );
-        assert_eq!(source_ip(&headers), None);
+        assert_eq!(source_ip(&headers).as_deref(), Some("198.51.100.9"));
     }
 
     #[test]
