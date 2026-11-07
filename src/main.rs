@@ -16,7 +16,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
@@ -34,7 +34,7 @@ use rustls::{
     pki_types::{EchConfigListBytes, ServerName},
     ClientConfig, RootCertStore,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     net::{lookup_host, TcpStream},
     sync::RwLock,
@@ -213,6 +213,7 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/diag/realip", get(realip_diag))
+        .route("/diag/guard-test", post(guard_test))
         .route(&config.public_relay_path, get(relay_upgrade));
 
     if config.public_relay_path != LEGACY_PUBLIC_RELAY_PATH {
@@ -256,7 +257,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         signed_realip_bridge: env::var("REALIP_BRIDGE_SECRET")
             .map(|value| value.len() >= 32)
             .unwrap_or(false),
-        build: "parspack-fixed-signed-realip-backend-v1",
+        build: "parspack-fixed-signed-realip-guardtest-v2",
     })
 }
 
@@ -292,6 +293,79 @@ async fn realip_diag(headers: HeaderMap) -> Json<RealIpDiag> {
         parsed_source_ip,
         headers: captured,
     })
+}
+
+const GUARD_TEST_UUID: &str = "24f1b45e-3177-4d66-ae68-eca34c7ddca3";
+
+#[derive(Deserialize)]
+struct GuardTestRequest {
+    event: String,
+    session_id: String,
+}
+
+#[derive(Serialize)]
+struct GuardTestResponse {
+    ok: bool,
+    source_ip: Option<String>,
+    known: bool,
+    locked: bool,
+    active_sources: usize,
+    active_sessions: usize,
+    reason: String,
+}
+
+async fn guard_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<GuardTestRequest>,
+) -> impl IntoResponse {
+    let source_ip = guard::source_ip(&headers);
+    let Some(ip) = source_ip.clone() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(GuardTestResponse {
+                ok: false,
+                source_ip: None,
+                known: false,
+                locked: false,
+                active_sources: 0,
+                active_sessions: 0,
+                reason: "signed_source_ip_required".to_owned(),
+            }),
+        );
+    };
+
+    let Some(out) = state
+        .guard
+        .diag_event(GUARD_TEST_UUID, &ip, &input.session_id, &input.event)
+        .await
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(GuardTestResponse {
+                ok: false,
+                source_ip: Some(ip),
+                known: false,
+                locked: false,
+                active_sources: 0,
+                active_sessions: 0,
+                reason: "invalid_guard_test_event".to_owned(),
+            }),
+        );
+    };
+
+    (
+        StatusCode::OK,
+        Json(GuardTestResponse {
+            ok: true,
+            source_ip: Some(ip),
+            known: out.known,
+            locked: out.locked,
+            active_sources: out.active_sources,
+            active_sessions: out.active_sessions,
+            reason: out.reason,
+        }),
+    )
 }
 
 async fn not_found() -> impl IntoResponse {
