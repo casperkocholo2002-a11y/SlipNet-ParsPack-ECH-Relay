@@ -250,43 +250,101 @@ impl SessionGuard {
 }
 
 pub fn source_ip(headers: &HeaderMap) -> Option<String> {
-    for (name, forwarded) in [
-        ("x-real-ip", false),
-        ("x-forwarded-for", true),
-        ("x-client-ip", false),
-        ("ar-real-ip", false),
-    ] {
+    if let Some(ip) = signed_bridge_ip(headers) {
+        return Some(ip);
+    }
+
+    for name in ["x-real-ip", "x-client-ip", "ar-real-ip", "x-forwarded-for"] {
         let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
             continue;
         };
-        if let Some(ip) = normalize_ip(value, forwarded) {
-            return Some(ip);
+        for candidate in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(ip) = normalize_ip(candidate) {
+                if is_public_ip(&ip) {
+                    return Some(ip.to_string());
+                }
+            }
         }
     }
     None
 }
 
-fn normalize_ip(raw: &str, forwarded: bool) -> Option<String> {
-    let mut value = raw.trim();
-    let parts: Vec<&str> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .collect();
-    if parts.len() > 1 {
-        value = if forwarded {
-            *parts.last()?
-        } else {
-            *parts.first()?
-        };
+fn signed_bridge_ip(headers: &HeaderMap) -> Option<String> {
+    let secret = env::var("REALIP_BRIDGE_SECRET").ok()?;
+    if secret.len() < 32 {
+        return None;
     }
+
+    let raw_ip = headers.get("x-slipnet-real-ip")?.to_str().ok()?;
+    let ts = headers
+        .get("x-slipnet-real-ip-ts")?
+        .to_str()
+        .ok()?
+        .parse::<i64>()
+        .ok()?;
+    let proof = headers
+        .get("x-slipnet-real-ip-proof")?
+        .to_str()
+        .ok()?;
+
+    let ip = normalize_ip(raw_ip)?;
+    if !is_public_ip(&ip) {
+        return None;
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    if (now - ts).abs() > 30 {
+        return None;
+    }
+
+    let message = format!("{}|{}", ip, ts);
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let expected = hex_bytes(hmac::sign(&key, message.as_bytes()).as_ref());
+    if expected.len() != proof.len()
+        || !expected
+            .bytes()
+            .zip(proof.bytes())
+            .fold(true, |acc, (a, b)| acc & (a == b))
+    {
+        return None;
+    }
+
+    Some(ip.to_string())
+}
+
+fn normalize_ip(raw: &str) -> Option<IpAddr> {
+    let mut value = raw.trim();
     if let Some(v) = value.strip_prefix("::ffff:") {
         value = v;
     }
     if let Some((v, _)) = value.split_once('%') {
         value = v;
     }
-    value.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+    value.parse::<IpAddr>().ok()
+}
+
+fn is_public_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 224)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
 }
 
 async fn read_initial(client: &mut WebSocket) -> Result<(Vec<Message>, Vec<u8>)> {
@@ -464,7 +522,7 @@ mod tests {
             "x-forwarded-for",
             HeaderValue::from_static("192.0.2.1, 198.51.100.9"),
         );
-        assert_eq!(source_ip(&headers).as_deref(), Some("198.51.100.9"));
+        assert_eq!(source_ip(&headers), None);
     }
 
     #[test]
